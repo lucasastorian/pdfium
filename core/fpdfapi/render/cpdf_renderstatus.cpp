@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -80,6 +81,138 @@ namespace {
 
 constexpr int kRenderMaxRecursionDepth = 64;
 int g_CurrentRecursionDepth = 0;
+
+struct RectHoleClipPath {
+  CFX_FloatRect outer_rect;
+  std::vector<CFX_FloatRect> holes;
+};
+
+struct RectHoleClipRegion {
+  CFX_FloatRect clip_rect;
+  std::vector<CFX_FloatRect> holes;
+};
+
+bool ShareVerticalExtent(const CFX_FloatRect& lhs, const CFX_FloatRect& rhs) {
+  return FXSYS_IsFloatEqual(lhs.bottom, rhs.bottom) &&
+         FXSYS_IsFloatEqual(lhs.top, rhs.top);
+}
+
+void AppendPathPoint(CFX_Path* path, const CFX_Path::Point& point) {
+  if (point.close_figure_) {
+    path->AppendPointAndClose(point.point_, point.type_);
+    return;
+  }
+  path->AppendPoint(point.point_, point.type_);
+}
+
+std::optional<std::vector<CFX_FloatRect>> ExtractRectSubpaths(
+    const CFX_Path& path) {
+  const auto& points = path.GetPoints();
+  if (points.empty()) {
+    return std::vector<CFX_FloatRect>();
+  }
+
+  std::vector<CFX_FloatRect> rects;
+  CFX_Path subpath;
+  for (const auto& point : points) {
+    if (point.type_ == CFX_Path::Point::Type::kMove &&
+        !subpath.GetPoints().empty()) {
+      std::optional<CFX_FloatRect> rect = subpath.GetRect(nullptr);
+      if (!rect.has_value()) {
+        return std::nullopt;
+      }
+      rects.push_back(rect.value());
+      subpath.Clear();
+    }
+    AppendPathPoint(&subpath, point);
+    if (point.close_figure_) {
+      std::optional<CFX_FloatRect> rect = subpath.GetRect(nullptr);
+      if (!rect.has_value()) {
+        return std::nullopt;
+      }
+      rects.push_back(rect.value());
+      subpath.Clear();
+    }
+  }
+  if (!subpath.GetPoints().empty()) {
+    std::optional<CFX_FloatRect> rect = subpath.GetRect(nullptr);
+    if (!rect.has_value()) {
+      return std::nullopt;
+    }
+    rects.push_back(rect.value());
+  }
+  return rects;
+}
+
+std::optional<RectHoleClipPath> ExtractRectHoleClipPath(
+    const CPDF_Path& clip_path,
+    CFX_FillRenderOptions::FillType fill_type) {
+  const CFX_Path* path = clip_path.GetObject();
+  if (!path) {
+    return std::nullopt;
+  }
+
+  std::optional<std::vector<CFX_FloatRect>> rects = ExtractRectSubpaths(*path);
+  if (!rects.has_value() || rects->empty()) {
+    return std::nullopt;
+  }
+
+  if (rects->size() == 1) {
+    return RectHoleClipPath{.outer_rect = rects->front(), .holes = {}};
+  }
+  if (fill_type != CFX_FillRenderOptions::FillType::kEvenOdd) {
+    return std::nullopt;
+  }
+
+  const auto outer_it = std::find_if(
+      rects->begin(), rects->end(), [&rects](const CFX_FloatRect& candidate) {
+        return std::ranges::all_of(
+            rects->begin(), rects->end(),
+            [&candidate](const CFX_FloatRect& rect) {
+              return rect == candidate || candidate.Contains(rect);
+            });
+      });
+  if (outer_it == rects->end()) {
+    return std::nullopt;
+  }
+
+  RectHoleClipPath result{.outer_rect = *outer_it, .holes = {}};
+  for (const auto& rect : rects.value()) {
+    if (rect != result.outer_rect) {
+      result.holes.push_back(rect);
+    }
+  }
+  return result;
+}
+
+std::optional<RectHoleClipRegion> ExtractRectHoleClipRegion(
+    const CPDF_ClipPath& clip_path) {
+  if (!clip_path.HasRef() || clip_path.GetTextCount() != 0 ||
+      clip_path.GetPathCount() == 0) {
+    return std::nullopt;
+  }
+
+  std::optional<CFX_FloatRect> clip_rect;
+  std::vector<CFX_FloatRect> holes;
+  for (size_t i = 0; i < clip_path.GetPathCount(); ++i) {
+    std::optional<RectHoleClipPath> path_data =
+        ExtractRectHoleClipPath(clip_path.GetPath(i), clip_path.GetClipType(i));
+    if (!path_data.has_value()) {
+      return std::nullopt;
+    }
+    if (!clip_rect.has_value()) {
+      clip_rect = path_data->outer_rect;
+    } else {
+      clip_rect->Intersect(path_data->outer_rect);
+    }
+    holes.insert(holes.end(), path_data->holes.begin(), path_data->holes.end());
+  }
+  if (!clip_rect.has_value()) {
+    return std::nullopt;
+  }
+  return RectHoleClipRegion{.clip_rect = clip_rect.value(),
+                            .holes = std::move(holes)};
+}
 
 CFX_FillRenderOptions GetFillOptionsForDrawPathWithBlend(
     const CPDF_RenderOptions::Options& options,
@@ -236,6 +369,125 @@ void CPDF_RenderStatus::RenderObjectList(
   }
 }
 
+bool CPDF_RenderStatus::TryDrawPathWithRectHoleClip(
+    CPDF_PathObject* path_obj,
+    const CFX_Matrix& mtObj2Device) {
+  DCHECK(path_obj);
+
+  if (!path_obj->clip_path().HasRef() ||
+      path_obj->clip_path().GetTextCount() != 0 ||
+      path_obj->general_state().GetBlendType() != BlendMode::kNormal ||
+      path_obj->general_state().GetSoftMask()) {
+    return false;
+  }
+
+  CFX_FillRenderOptions::FillType fill_type = path_obj->filltype();
+  bool stroke = path_obj->stroke();
+  if (const CPDF_Color* fill_color = path_obj->color_state().GetFillColor();
+      fill_color && fill_color->IsPattern()) {
+    return false;
+  }
+  if (const CPDF_Color* stroke_color = path_obj->color_state().GetStrokeColor();
+      stroke && stroke_color && stroke_color->IsPattern()) {
+    return false;
+  }
+  if (fill_type == CFX_FillRenderOptions::FillType::kNoFill || stroke) {
+    return false;
+  }
+
+  const CPDF_RenderOptions::Options& options = options_.GetOptions();
+  if (options_.ColorModeIs(CPDF_RenderOptions::Type::kForcedColor) &&
+      options.bConvertFillToStroke) {
+    return false;
+  }
+
+  std::optional<RectHoleClipRegion> clip_region =
+      ExtractRectHoleClipRegion(path_obj->clip_path());
+  if (!clip_region.has_value()) {
+    return false;
+  }
+
+  const CFX_Path* object_path = path_obj->path().GetObject();
+  if (!object_path) {
+    return false;
+  }
+
+  std::optional<CFX_FloatRect> object_rect =
+      object_path->GetRect(&path_obj->matrix());
+  if (!object_rect.has_value()) {
+    return false;
+  }
+
+  CFX_FloatRect visible_rect = object_rect.value();
+  visible_rect.Intersect(clip_region->clip_rect);
+  if (visible_rect.IsEmpty()) {
+    if (last_clip_path_.HasRef()) {
+      device_->RestoreState(true);
+      last_clip_path_.SetNull();
+    }
+    return true;
+  }
+
+  std::vector<std::pair<float, float>> blocked_intervals;
+  blocked_intervals.reserve(clip_region->holes.size());
+  for (const auto& hole : clip_region->holes) {
+    CFX_FloatRect overlap = hole;
+    overlap.Intersect(visible_rect);
+    if (!overlap.IsEmpty()) {
+      if (!ShareVerticalExtent(overlap, visible_rect)) {
+        return false;
+      }
+      blocked_intervals.emplace_back(overlap.left, overlap.right);
+    }
+  }
+  std::ranges::sort(blocked_intervals);
+
+  if (last_clip_path_.HasRef()) {
+    device_->RestoreState(true);
+    last_clip_path_.SetNull();
+  }
+
+  const uint32_t fill_argb = GetFillArgb(path_obj);
+  if (!fill_argb) {
+    return true;
+  }
+
+  const CFX_FillRenderOptions fill_options = GetFillOptionsForDrawPathWithBlend(
+      options, path_obj, fill_type, /*is_stroke=*/false, type3_char_);
+
+  float current_left = visible_rect.left;
+  for (const auto& [blocked_left, blocked_right] : blocked_intervals) {
+    if (blocked_right <= current_left) {
+      continue;
+    }
+    if (blocked_left > visible_rect.right) {
+      break;
+    }
+    if (blocked_left > current_left) {
+      CFX_Path draw_path;
+      draw_path.AppendRect(current_left, visible_rect.bottom,
+                           std::min(blocked_left, visible_rect.right),
+                           visible_rect.top);
+      device_->DrawPath(draw_path, &mtObj2Device,
+                        /*pGraphState=*/nullptr, fill_argb, /*stroke_color=*/0,
+                        fill_options);
+    }
+    current_left = std::max(current_left, blocked_right);
+    if (current_left >= visible_rect.right) {
+      return true;
+    }
+  }
+
+  if (current_left < visible_rect.right) {
+    CFX_Path draw_path;
+    draw_path.AppendRect(current_left, visible_rect.bottom, visible_rect.right,
+                         visible_rect.top);
+    device_->DrawPath(draw_path, &mtObj2Device, /*pGraphState=*/nullptr,
+                      fill_argb, /*stroke_color=*/0, fill_options);
+  }
+  return true;
+}
+
 void CPDF_RenderStatus::RenderSingleObject(CPDF_PageObject* pObj,
                                            const CFX_Matrix& mtObj2Device) {
   AutoRestorer<int> restorer(&g_CurrentRecursionDepth);
@@ -244,6 +496,10 @@ void CPDF_RenderStatus::RenderSingleObject(CPDF_PageObject* pObj,
   }
   cur_obj_ = pObj;
   if (!options_.CheckPageObjectVisible(pObj)) {
+    return;
+  }
+  if (pObj->IsPath() &&
+      TryDrawPathWithRectHoleClip(pObj->AsPath(), mtObj2Device)) {
     return;
   }
   ProcessClipPath(pObj->clip_path(), mtObj2Device);
@@ -270,6 +526,11 @@ bool CPDF_RenderStatus::ContinueSingleObject(CPDF_PageObject* pObj,
 
   cur_obj_ = pObj;
   if (!options_.CheckPageObjectVisible(pObj)) {
+    return false;
+  }
+
+  if (pObj->IsPath() &&
+      TryDrawPathWithRectHoleClip(pObj->AsPath(), mtObj2Device)) {
     return false;
   }
 

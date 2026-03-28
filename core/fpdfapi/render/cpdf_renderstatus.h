@@ -130,6 +130,8 @@ class CPDF_RenderStatus {
       bool stroke);
 
  private:
+  bool TryDrawPathWithRectHoleClip(CPDF_PathObject* path_obj,
+                                   const CFX_Matrix& mtObj2Device);
   bool ProcessTransparency(CPDF_PageObject* PageObj,
                            const CFX_Matrix& mtObj2Device);
   void ProcessObjectNoClip(CPDF_PageObject* pObj,
